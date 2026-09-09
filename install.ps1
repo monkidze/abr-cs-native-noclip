@@ -10,6 +10,7 @@ $PatchOffset = 0x41E1B
 [byte[]]$OriginalBytes = 0x0F, 0x84, 0xC7, 0x00, 0x00, 0x00
 [byte[]]$PatchedBytes = 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
 $Binding = "bind_console demo_record 1 kF2"
+$ChangesStarted = $false
 
 function Test-Bytes {
     param([byte[]]$Data, [int]$Offset, [byte[]]$Expected)
@@ -32,7 +33,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($GamePath)) {
         $GamePath = Read-Host "Enter your STALKER Clear Sky folder"
     }
-    $GamePath = (Resolve-Path -LiteralPath $GamePath).Path
+    $GamePath = (Resolve-Path -LiteralPath $GamePath.Trim().Trim('"')).Path
 
     $EnginePath = Join-Path $GamePath "bin\xrEngine.exe"
     $UserConfigPath = Join-Path $GamePath "_appdata_\user.ltx"
@@ -44,8 +45,22 @@ try {
     }
 
     $EngineHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $EnginePath).Hash
-    $ConfigText = [IO.File]::ReadAllText($UserConfigPath)
-    $BindingPresent = $ConfigText -match "(?m)^bind_console\s+demo_record\s+1\s+kF2\s*$"
+    # Latin-1 maps every byte 1:1; editing ASCII commands preserves legacy
+    # code pages, UTF-8 bytes, comments and existing line endings exactly.
+    $Encoding = [Text.Encoding]::GetEncoding(28591)
+    [byte[]]$ConfigBytes = [IO.File]::ReadAllBytes($UserConfigPath)
+    if ($ConfigBytes -contains 0 -or ($ConfigBytes.Length -ge 2 -and $ConfigBytes[0] -in 254,255)) {
+        throw 'UTF-16 or binary user.ltx is unsupported. No files were changed.'
+    }
+    $ConfigText = $Encoding.GetString($ConfigBytes)
+    if ($ConfigText -match '(?im)^\s*(?:bind|bind_sec|bind_console)\s+.*\s+kF2\s*$' -and
+        $ConfigText -match '(?im)^\s*(?:bind|bind_sec|bind_console)\s+(?!demo_record\s+1\s+kF2\s*$).*\s+kF2\s*$') {
+        throw 'F2 is already assigned. Choose another key for that binding before installing. No files were changed.'
+    }
+    $OwnPattern = '(?im)^[\t ]*bind_console[\t ]+demo_record[\t ]+1[\t ]+kF2[\t ]*(?:\r?\n|$)'
+    $OwnBindings = [regex]::Matches($ConfigText, $OwnPattern)
+    $Resets = [regex]::Matches($ConfigText, '(?im)^[\t ]*(?:default_controls|unbindall|unbind_console[\t ]+kF2)[\t ]*(?:\r?\n|$)')
+    $BindingPresent = $OwnBindings.Count -eq 1 -and ($Resets.Count -eq 0 -or $OwnBindings[0].Index -gt $Resets[$Resets.Count - 1].Index)
 
     if ($EngineHash -eq $PatchedEngineHash -and $BindingPresent) {
         Write-Host "Native noclip is already installed." -ForegroundColor Green
@@ -55,10 +70,15 @@ try {
         throw "This xrEngine.exe is not the supported ABR CS MOD Final build. No files were changed."
     }
 
-    $BackupPath = Join-Path $GamePath ("_abr_noclip_backup_" + (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $BackupPath = Join-Path $GamePath ("_abr_noclip_backup_" + (Get-Date -Format "yyyyMMdd_HHmmss") + '_' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path (Join-Path $BackupPath "bin"), (Join-Path $BackupPath "_appdata_") -Force | Out-Null
     Copy-Item -LiteralPath $EnginePath -Destination (Join-Path $BackupPath "bin\xrEngine.exe")
     Copy-Item -LiteralPath $UserConfigPath -Destination (Join-Path $BackupPath "_appdata_\user.ltx")
+    if ((Get-FileHash -LiteralPath (Join-Path $BackupPath 'bin\xrEngine.exe')).Hash -ne $EngineHash -or
+        (Get-FileHash -LiteralPath (Join-Path $BackupPath '_appdata_\user.ltx')).Hash -ne (Get-FileHash -LiteralPath $UserConfigPath).Hash) {
+        throw 'Backup verification failed. No files were changed.'
+    }
+    $ChangesStarted = $true
 
     if ($EngineHash -eq $OriginalEngineHash) {
         [byte[]]$EngineData = [IO.File]::ReadAllBytes($EnginePath)
@@ -76,24 +96,13 @@ try {
         }
     }
 
-    $Lines = [regex]::Split($ConfigText, "\r?\n")
-    $NewLines = [Collections.Generic.List[string]]::new()
-    $Inserted = $false
-    foreach ($Line in $Lines) {
-        if ($Line -match "^bind_console\s+.+\s+kF2\s*$") {
-            continue
-        }
-        $NewLines.Add($Line)
-        if (-not $Inserted -and $Line.Trim() -eq "default_controls") {
-            $NewLines.Add($Binding)
-            $Inserted = $true
-        }
+    # Put the binding after all reset/default commands, not before them.
+    if (-not $BindingPresent) {
+        $ConfigText = [regex]::Replace($ConfigText, $OwnPattern, '')
+        $Newline = if ($ConfigText.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $Separator = if ($ConfigText.Length -gt 0 -and -not $ConfigText.EndsWith("`n")) { $Newline } else { '' }
+        [IO.File]::WriteAllBytes($UserConfigPath, $Encoding.GetBytes($ConfigText + $Separator + $Binding + $Newline))
     }
-    if (-not $Inserted) {
-        $NewLines.Insert(0, $Binding)
-    }
-    $Utf8NoBom = [Text.UTF8Encoding]::new($false)
-    [IO.File]::WriteAllText($UserConfigPath, (($NewLines -join "`r`n").TrimEnd() + "`r`n"), $Utf8NoBom)
 
     $FinalConfig = [IO.File]::ReadAllText($UserConfigPath)
     if ($FinalConfig -notmatch "(?m)^bind_console\s+demo_record\s+1\s+kF2\s*$") {
@@ -110,6 +119,18 @@ try {
     Write-Host "Escape: cancel without moving the actor"
 }
 catch {
+    if ($ChangesStarted) {
+        foreach ($Relative in @('bin\xrEngine.exe', '_appdata_\user.ltx')) {
+            try {
+                $Saved = Join-Path $BackupPath $Relative
+                $Target = Join-Path $GamePath $Relative
+                if ((Get-FileHash -LiteralPath $Saved).Hash -ne (Get-FileHash -LiteralPath $Target).Hash) {
+                    Copy-Item -LiteralPath $Saved -Destination $Target -Force
+                    if ((Get-FileHash -LiteralPath $Saved).Hash -ne (Get-FileHash -LiteralPath $Target).Hash) { throw 'Hash mismatch' }
+                }
+            } catch { Write-Host "Restore $Relative manually from $BackupPath : $_" -ForegroundColor Red }
+        }
+    }
     Write-Host ""
     Write-Host ("Installation failed: " + $_.Exception.Message) -ForegroundColor Red
     exit 1

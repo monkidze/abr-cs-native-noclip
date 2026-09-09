@@ -9,6 +9,8 @@ $PatchedEngineHash = "182CB3161F58AD90B01F53F6E25CC8BBAA0B07F9F4CD0C483D177C9EA9
 $PatchOffset = 0x41E1B
 [byte[]]$OriginalBytes = 0x0F, 0x84, 0xC7, 0x00, 0x00, 0x00
 [byte[]]$PatchedBytes = 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+$ChangesStarted = $false
+$ConfigExists = $false
 
 function Test-Bytes {
     param([byte[]]$Data, [int]$Offset, [byte[]]$Expected)
@@ -30,7 +32,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($GamePath)) {
         $GamePath = Read-Host "Enter your STALKER Clear Sky folder"
     }
-    $GamePath = (Resolve-Path -LiteralPath $GamePath).Path
+    $GamePath = (Resolve-Path -LiteralPath $GamePath.Trim().Trim('"')).Path
 
     $EnginePath = Join-Path $GamePath "bin\xrEngine.exe"
     $UserConfigPath = Join-Path $GamePath "_appdata_\user.ltx"
@@ -39,6 +41,23 @@ try {
     }
 
     $EngineHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $EnginePath).Hash
+    if ($EngineHash -ne $PatchedEngineHash -and $EngineHash -ne $OriginalEngineHash) {
+        throw 'Unsupported engine. No files were changed.'
+    }
+    $ConfigExists = Test-Path -LiteralPath $UserConfigPath -PathType Leaf
+    if ($ConfigExists) {
+        $Encoding = [Text.Encoding]::GetEncoding(28591)
+        [byte[]]$ConfigBytes = [IO.File]::ReadAllBytes($UserConfigPath)
+        if ($ConfigBytes -contains 0 -or ($ConfigBytes.Length -ge 2 -and $ConfigBytes[0] -in 254,255)) {
+            throw 'UTF-16 or binary user.ltx is unsupported. No files were changed.'
+        }
+        $ConfigText = $Encoding.GetString($ConfigBytes)
+    }
+    $BackupPath = Join-Path $GamePath ('_abr_noclip_uninstall_backup_' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path (Join-Path $BackupPath 'bin'), (Join-Path $BackupPath '_appdata_') | Out-Null
+    Copy-Item -LiteralPath $EnginePath -Destination (Join-Path $BackupPath 'bin\xrEngine.exe')
+    if ($ConfigExists) { Copy-Item -LiteralPath $UserConfigPath -Destination (Join-Path $BackupPath '_appdata_\user.ltx') }
+    $ChangesStarted = $true
     if ($EngineHash -eq $PatchedEngineHash) {
         [byte[]]$EngineData = [IO.File]::ReadAllBytes($EnginePath)
         if (-not (Test-Bytes -Data $EngineData -Offset $PatchOffset -Expected $PatchedBytes)) {
@@ -56,19 +75,32 @@ try {
         throw "This xrEngine.exe is not a recognized original or patched ABR build. No files were changed."
     }
 
-    if (Test-Path -LiteralPath $UserConfigPath -PathType Leaf) {
-        $ConfigText = [IO.File]::ReadAllText($UserConfigPath)
-        $Lines = [regex]::Split($ConfigText, "\r?\n") | Where-Object {
-            $_ -notmatch "^bind_console\s+demo_record\s+1\s+kF2\s*$"
+    if ($ConfigExists) {
+        $NewText = [regex]::Replace($ConfigText, '(?im)^[\t ]*bind_console[\t ]+demo_record[\t ]+1[\t ]+kF2[\t ]*(?:\r?\n|$)', '')
+        if ($NewText -ne $ConfigText) {
+            [IO.File]::WriteAllBytes($UserConfigPath, $Encoding.GetBytes($NewText))
+            if ($Encoding.GetString([IO.File]::ReadAllBytes($UserConfigPath)) -cne $NewText) { throw 'Config verification failed.' }
         }
-        $Utf8NoBom = [Text.UTF8Encoding]::new($false)
-        [IO.File]::WriteAllText($UserConfigPath, (($Lines -join "`r`n").TrimEnd() + "`r`n"), $Utf8NoBom)
     }
 
     Write-Host "ABR Native Noclip removed successfully." -ForegroundColor Green
     Write-Host "Your _abr_noclip_backup_* folder was kept for safety."
 }
 catch {
+    if ($ChangesStarted) {
+        $RestorePaths = @('bin\xrEngine.exe')
+        if ($ConfigExists) { $RestorePaths += '_appdata_\user.ltx' }
+        foreach ($Relative in $RestorePaths) {
+            try {
+                $Saved = Join-Path $BackupPath $Relative
+                $Target = Join-Path $GamePath $Relative
+                if ((Get-FileHash -LiteralPath $Saved).Hash -ne (Get-FileHash -LiteralPath $Target).Hash) {
+                    Copy-Item -LiteralPath $Saved -Destination $Target -Force
+                    if ((Get-FileHash -LiteralPath $Saved).Hash -ne (Get-FileHash -LiteralPath $Target).Hash) { throw 'Hash mismatch' }
+                }
+            } catch { Write-Host "Restore $Relative manually from $BackupPath : $_" -ForegroundColor Red }
+        }
+    }
     Write-Host ""
     Write-Host ("Uninstall failed: " + $_.Exception.Message) -ForegroundColor Red
     exit 1
